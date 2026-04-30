@@ -1,0 +1,6 @@
+openai
+pyyaml
+fastapi
+uvicorn
+aiofiles
+mmh3

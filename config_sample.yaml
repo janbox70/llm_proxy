@@ -1,0 +1,15 @@
+## 配置文件
+## 这里配置了 api_key，则对输入的原始api_key进行校验，如果成功，则填写真正的api_key进行转发；如果失败，则返回400
+
+log_path: ./output
+
+providers:
+  qwencodingplan:
+    base_url: https://coding.dashscope.aliyuncs.com/v1/
+    # api_key: your-qwencodingplan-api-key
+
+  openrouter:
+    base_url: https://openrouter.ai/api/v1/
+    api_key: your-openrouter-api-key
+    authorized_keys:
+      - 
