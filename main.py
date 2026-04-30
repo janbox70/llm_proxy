@@ -1,16 +1,61 @@
-from datetime import datetime
+import asyncio
 import inspect
-import json
 import yaml
 import os
 import traceback
+from contextlib import asynccontextmanager
 from fastapi import Depends, Header, Request, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import APIError, AsyncOpenAI as OpenAI, AsyncStream
 from logger import ChatLogger, _remove_image_data
 
 
-app = FastAPI()
+class ConfigManager:
+    """配置管理器，缓存配置并支持热加载"""
+    def __init__(self):
+        self._config = None
+        self._config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.yaml"
+        )
+
+    async def load(self):
+        """加载配置文件"""
+        loop = asyncio.get_event_loop()
+        config = await loop.run_in_executor(None, self._load_config)
+        self._config = config
+        return config
+
+    def _load_config(self):
+        """同步加载配置"""
+        with open(self._config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    @property
+    def config(self):
+        """获取当前配置"""
+        return self._config
+
+
+config_manager = ConfigManager()
+
+
+# 客户端缓存，避免重复创建
+_client_cache = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # 启动时加载配置
+    await config_manager.load()
+    yield
+    # 关闭时清理客户端
+    for client in _client_cache.values():
+        await client.close()
+    _client_cache.clear()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
@@ -56,15 +101,21 @@ async def get_api_key(authorization: str = Header(None)):
     parts = authorization.split()
     if len(parts) == 1:
         return parts[0]
-    return parts[1]
+    if len(parts) > 1 and parts[1]:
+        return parts[1]
+    raise HTTPException(
+        status_code=401, detail="Invalid authorization header")
 
-# 记录日志
 
-
-async def load_config():
-    path = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(path, f"config.yaml"), "r") as f:
-        return yaml.safe_load(f)
+def get_client(base_url: str, api_key: str) -> OpenAI:
+    """获取或创建 OpenAI 客户端（带缓存）"""
+    cache_key = f"{base_url}:{api_key}"
+    if cache_key not in _client_cache:
+        _client_cache[cache_key] = OpenAI(
+            api_key=api_key,
+            base_url=base_url
+        )
+    return _client_cache[cache_key]
 
 
 @app.post("/{provider}/chat/completions", summary="标准OPEN AI聊天接口")
@@ -72,13 +123,15 @@ async def standard_chat(provider: str, request: Request, api_key=Depends(get_api
 
     data = await request.json()
 
-    config = await load_config()
-    
+    config = config_manager.config
+    if config is None:
+        raise HTTPException(status_code=500, detail="Configuration not loaded")
+
     logger = ChatLogger(config.get("log_path", "logs"), provider, api_key, data)
 
     try:
         site_config = config.get("providers", {}).get(provider, {})
-        if 'base_url' not in site_config:
+        if not site_config or 'base_url' not in site_config:
             raise HTTPException(
                 status_code=400, detail=f"Unsupported provider: {provider}")
 
@@ -86,8 +139,8 @@ async def standard_chat(provider: str, request: Request, api_key=Depends(get_api
         if api_key in site_config.get("authorized_keys", []):
             api_key = site_config.get("api_key", api_key)
 
-        client = OpenAI(api_key=api_key,
-                        base_url=site_config.get("base_url", ""))
+        base_url = site_config.get("base_url", "")
+        client = get_client(base_url, api_key)
         params = inspect.signature(client.chat.completions.create).parameters
 
         unsupport_params = ['frequency_penalty',
@@ -110,9 +163,11 @@ async def standard_chat(provider: str, request: Request, api_key=Depends(get_api
             return StreamingResponse(_iter_events(response, logger), media_type="text/event-stream")
 
         await logger.write_log(response.model_dump())
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"ERROR!!: provider {provider}, api-key {api_key}")
+        print(f"ERROR!!: provider {provider}")
         print(_remove_image_data(data))
-        raise e
+        raise HTTPException(status_code=500, detail=str(e))
 
     return response

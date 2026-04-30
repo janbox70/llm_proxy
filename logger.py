@@ -162,7 +162,7 @@ class ChatLogger:
 
     async def _save_image(self, url: str) -> str:
         """
-        把 image_url 指向的图片保存到 logs/{provider}/images/ 目录，
+        把 image_url 指向的图片保存到 {log_path}/images/ 目录，
         返回保存时使用的本地文件名。如果保存失败，则返回原始 url。
         """
         h = None
@@ -185,7 +185,7 @@ class ChatLogger:
             # 索引失败不影响主流程（继续走原有 try 保存逻辑）
             h = None
         try:
-            image_dir = Path("logs") / "images"
+            image_dir = Path(self.log_path) / "images"
             image_dir.mkdir(parents=True, exist_ok=True)
 
             # 生成文件名
