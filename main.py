@@ -140,7 +140,8 @@ async def standard_chat(provider: str, request: Request, api_key=Depends(get_api
     if config is None:
         raise HTTPException(status_code=500, detail="Configuration not loaded")
 
-    logger = ChatLogger(config.get("log_path", "logs"), provider, api_key, data)
+    logger = ChatLogger(config.get("log_path", "logs"), provider, api_key, data,
+                        path="v1/chat/completions", upstream_path="v1/chat/completions")
 
     try:
         site_config = config.get("providers", {}).get(provider, {})
@@ -248,7 +249,8 @@ async def anthropic_messages(
         raise HTTPException(status_code=500, detail="Configuration not loaded")
 
     logger = AnthropicChatLogger(
-        config.get("log_path", "logs"), provider, api_key, data
+        config.get("log_path", "logs"), provider, api_key, data,
+        path="v1/messages", upstream_path=""
     )
 
     try:
@@ -271,19 +273,22 @@ async def anthropic_messages(
 
         if api_type == "anthropic":
             # 直接转发到 Anthropic API
+            logger.upstream_path = "v1/messages"
             return await _forward_to_anthropic(
                 provider, base_url, real_key, data, is_stream, request, logger
             )
         else:
             # 转换为 OpenAI 格式，调用 OpenAI 兼容接口
+            logger.upstream_path = "v1/chat/completions"
             return await _forward_to_openai_as_anthropic(
                 provider, base_url, real_key, data, is_stream, logger
             )
-
-    except HTTPException:
-        raise
     except Exception as e:
         print(f"ERROR!!: anthropic provider {provider}")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {e}")
+        import traceback
+        traceback.print_exc()
         print(_remove_anthropic_image_data(data))
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -420,6 +425,7 @@ async def _forward_to_openai_as_anthropic(
 
     except Exception as e:
         # 将 OpenAI 错误转换为 Anthropic 格式错误
+        raise e
         return _format_anthropic_error(e)
 
 

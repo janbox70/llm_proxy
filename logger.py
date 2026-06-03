@@ -8,21 +8,24 @@ import aiofiles
 import mmh3
 
 
-class ChatLogger:
-    def __init__(self, log_path, provider: str, api_key: str, input_data: dict):
+class BaseLogger:
+    """日志基类，提供通用的日志写入、文件滚动、图片保存功能"""
+
+    def __init__(self, log_path, provider: str, api_key: str, input_data: dict,
+                 path: str = "", upstream_path: str = ""):
         self.log_path = log_path
         self.provider = provider
         self.api_key = api_key
         self.input_data = input_data
-        self.output = {"content": "", "reasoning_content": "",
-                       "usage": None, "tool_calls": {}}
-        self._image_index = 0
+        self.path = path
+        self.upstream_path = upstream_path
         self.start_time = datetime.now()
         self.first_token_time = None
         self._image_ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         # MurmurHash3(data) -> saved filename (LRU, keep last 200)
         self._image_hash_index: "OrderedDict[int, str]" = OrderedDict()
         self._image_hash_index_limit = 200
+        self._image_index = 0
 
     async def write(self, data: dict):
         """将一条日志写入 jsonl 文件，并在超出大小时做简单滚动。"""
@@ -56,7 +59,70 @@ class ChatLogger:
                 src.rename(log_dir / f"chat.{i + 1}.jsonl")
 
         # 当前文件变为最新的历史文件
-        log_file.rename(log_dir / "chat.1.jsonl")
+        log_file.rename(log_dir / f"chat.1.jsonl")
+
+    async def _save_image(self, b64data: str, media_type: str = "image/png") -> str:
+        """
+        将 base64 图片数据保存为文件，返回文件名。
+        使用 hash 去重避免重复保存。
+        """
+        h = None
+        try:
+            h = mmh3.hash128(b64data, signed=False)
+            existing = self._image_hash_index.get(h)
+            if existing:
+                self._image_hash_index.move_to_end(h)
+                return existing
+            self._image_hash_index[h] = ""
+            self._image_hash_index.move_to_end(h)
+            while len(self._image_hash_index) > self._image_hash_index_limit:
+                self._image_hash_index.popitem(last=False)
+        except Exception:
+            h = None
+
+        try:
+            image_dir = Path(self.log_path) / "images"
+            image_dir.mkdir(parents=True, exist_ok=True)
+
+            index = self._image_index
+            self._image_index += 1
+
+            # 解析媒体类型确定扩展名
+            if "jpeg" in media_type or "jpg" in media_type:
+                ext = "jpg"
+            elif "webp" in media_type:
+                ext = "webp"
+            elif "gif" in media_type:
+                ext = "gif"
+            else:
+                ext = "png"
+
+            data = base64.b64decode(b64data)
+            filename = f"{self._image_ts}-{index}.{ext}"
+            file_path = image_dir / filename
+
+            async with aiofiles.open(file_path, "wb") as f:
+                await f.write(data)
+
+            if h is not None:
+                self._image_hash_index[h] = filename
+            return filename
+        except Exception:
+            return b64data
+
+    async def write_log(self, output=None):
+        """子类必须实现此方法"""
+        raise NotImplementedError
+
+
+class ChatLogger(BaseLogger):
+    """OpenAI Chat API 日志记录器"""
+
+    def __init__(self, log_path, provider: str, api_key: str, input_data: dict,
+                 path: str = "", upstream_path: str = ""):
+        super().__init__(log_path, provider, api_key, input_data, path, upstream_path)
+        self.output = {"content": "", "reasoning_content": "",
+                       "usage": None, "tool_calls": {}}
 
     def add_chunk(self, sse: bytes):
         """
@@ -125,10 +191,12 @@ class ChatLogger:
                 t.get("function").get("name", "") for t in tools]
 
         data = {
-            "st" : self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "ft" : (self.first_token_time - self.start_time).total_seconds() if self.first_token_time else 0,
+            "st": self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ft": (self.first_token_time - self.start_time).total_seconds() if self.first_token_time else 0,
             "time": (datetime.now() - self.start_time).total_seconds(),
             "api_key": self.api_key,
+            "path": self.path,
+            "upstream_path": self.upstream_path,
             "input": self.input_data,
             "output": self.output if output is None else output,
         }
@@ -146,7 +214,12 @@ class ChatLogger:
                 url = image_obj.get("url")
                 # 只处理 data:image/...;base64,...，其他 URL 保持不变
                 if isinstance(url, str) and url.startswith("data:"):
-                    image_obj["url"] = await self._save_image(url)
+                    # 解析 media_type
+                    header = url.split(",", 1)[0]  # data:image/png;base64
+                    media_type = header[5:] if header.startswith("data:") else "image/png"
+                    b64data = url.split(",", 1)[1] if "," in url else ""
+                    filename = await self._save_image(b64data, media_type)
+                    image_obj["url"] = filename
 
             # 继续递归其他键（避免对 image_url 再次递归，防止重复处理）
             for key, value in obj.items():
@@ -160,108 +233,14 @@ class ChatLogger:
 
         return obj
 
-    async def _save_image(self, url: str) -> str:
-        """
-        把 image_url 指向的图片保存到 {log_path}/images/ 目录，
-        返回保存时使用的本地文件名。如果保存失败，则返回原始 url。
-        """
-        h = None
-        try:
-            # 在 try 之前建立索引并查表：重复图片直接复用旧文件名
-            # 这里只处理 data:URL，例如 data:image/png;base64,xxxxx
-            if not url.startswith("data:"):
-                return url
-            h = mmh3.hash128(url, signed=False)
-            existing = self._image_hash_index.get(h)
-            if existing:
-                self._image_hash_index.move_to_end(h)
-                return existing
-            # 不存在则创建索引（占位，文件名会在 return filename 之前写入）
-            self._image_hash_index[h] = ""
-            self._image_hash_index.move_to_end(h)
-            while len(self._image_hash_index) > self._image_hash_index_limit:
-                self._image_hash_index.popitem(last=False)
-        except Exception:
-            # 索引失败不影响主流程（继续走原有 try 保存逻辑）
-            h = None
-        try:
-            image_dir = Path(self.log_path) / "images"
-            image_dir.mkdir(parents=True, exist_ok=True)
 
-            # 生成文件名
-            index = self._image_index
-            self._image_index += 1
-
-            # 这里只处理 data:URL，例如 data:image/png;base64,xxxxx
-            if not url.startswith("data:"):
-                return url
-
-            header, b64data = url.split(",", 1)
-            if "jpeg" in header or "jpg" in header:
-                ext = "jpg"
-            elif "webp" in header:
-                ext = "webp"
-            elif "gif" in header:
-                ext = "gif"
-            else:
-                ext = "png"
-
-            data = base64.b64decode(b64data)
-
-            filename = f"{self._image_ts}-{index}.{ext}"
-            file_path = image_dir / filename
-
-            async with aiofiles.open(file_path, "wb") as f:
-                await f.write(data)
-
-            # 记录索引，避免重复保存
-            if h is not None:
-                self._image_hash_index[h] = filename
-            return filename
-        except Exception:
-            # 出错时，不影响主流程，直接返回原始 url
-            return url
-
-
-def _remove_image_data(obj):
-    if isinstance(obj, dict):
-        if "image_url" in obj:
-            obj["image_url"]["url"] = ""
-        return {k: _remove_image_data(v) for k, v in obj.items()}
-
-    if isinstance(obj, list):
-        return [_remove_image_data(item) for item in obj]
-    return obj
-
-
-def _remove_anthropic_image_data(obj):
-    """清除 Anthropic 格式中的 base64 图片数据，避免日志爆炸"""
-    if isinstance(obj, dict):
-        if obj.get("type") == "image" and isinstance(obj.get("source"), dict):
-            if "data" in obj["source"]:
-                obj["source"]["data"] = ""
-        return {k: _remove_anthropic_image_data(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_remove_anthropic_image_data(item) for item in obj]
-    return obj
-
-
-class AnthropicChatLogger(ChatLogger):
+class AnthropicChatLogger(BaseLogger):
     """Anthropic Messages API 专用日志记录器"""
 
-    def __init__(self, log_path, provider: str, api_key: str, input_data: dict):
-        # 跳过 ChatLogger.__init__，直接调用更上层的初始化
-        self.log_path = log_path
-        self.provider = provider
-        self.api_key = api_key
-        self.input_data = input_data
+    def __init__(self, log_path, provider: str, api_key: str, input_data: dict,
+                 path: str = "", upstream_path: str = ""):
+        super().__init__(log_path, provider, api_key, input_data, path, upstream_path)
         self.output = {"content": "", "tool_calls": {}, "stop_reason": "", "usage": None}
-        self._image_index = 0
-        self.start_time = datetime.now()
-        self.first_token_time = None
-        self._image_ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        self._image_hash_index: "OrderedDict[int, str]" = OrderedDict()
-        self._image_hash_index_limit = 200
         # SSE 解析缓冲
         self._buffer = ""
 
@@ -354,6 +333,8 @@ class AnthropicChatLogger(ChatLogger):
             ),
             "time": (datetime.now() - self.start_time).total_seconds(),
             "api_key": self.api_key,
+            "path": self.path,
+            "upstream_path": self.upstream_path,
             "input": self.input_data,
             "output": self.output if output is None else output,
         }
@@ -370,7 +351,7 @@ class AnthropicChatLogger(ChatLogger):
                 if source.get("type") == "base64" and "data" in source:
                     media_type = source.get("media_type", "image/png")
                     b64data = source["data"]
-                    filename = await self._save_b64_image(b64data, media_type)
+                    filename = await self._save_image(b64data, media_type)
                     source["data"] = filename
 
             for key, value in obj.items():
@@ -382,50 +363,25 @@ class AnthropicChatLogger(ChatLogger):
 
         return obj
 
-    async def _save_b64_image(self, b64data: str, media_type: str) -> str:
-        """
-        将 base64 图片数据保存为文件，返回文件名。
-        使用 hash 去重避免重复保存。
-        """
-        h = None
-        try:
-            h = mmh3.hash128(b64data, signed=False)
-            existing = self._image_hash_index.get(h)
-            if existing:
-                self._image_hash_index.move_to_end(h)
-                return existing
-            self._image_hash_index[h] = ""
-            self._image_hash_index.move_to_end(h)
-            while len(self._image_hash_index) > self._image_hash_index_limit:
-                self._image_hash_index.popitem(last=False)
-        except Exception:
-            h = None
 
-        try:
-            image_dir = Path(self.log_path) / "images"
-            image_dir.mkdir(parents=True, exist_ok=True)
+def _remove_image_data(obj):
+    if isinstance(obj, dict):
+        if "image_url" in obj:
+            obj["image_url"]["url"] = ""
+        return {k: _remove_image_data(v) for k, v in obj.items()}
 
-            index = self._image_index
-            self._image_index += 1
+    if isinstance(obj, list):
+        return [_remove_image_data(item) for item in obj]
+    return obj
 
-            if "jpeg" in media_type or "jpg" in media_type:
-                ext = "jpg"
-            elif "webp" in media_type:
-                ext = "webp"
-            elif "gif" in media_type:
-                ext = "gif"
-            else:
-                ext = "png"
 
-            data = base64.b64decode(b64data)
-            filename = f"{self._image_ts}-{index}.{ext}"
-            file_path = image_dir / filename
-
-            async with aiofiles.open(file_path, "wb") as f:
-                await f.write(data)
-
-            if h is not None:
-                self._image_hash_index[h] = filename
-            return filename
-        except Exception:
-            return b64data
+def _remove_anthropic_image_data(obj):
+    """清除 Anthropic 格式中的 base64 图片数据，避免日志爆炸"""
+    if isinstance(obj, dict):
+        if obj.get("type") == "image" and isinstance(obj.get("source"), dict):
+            if "data" in obj["source"]:
+                obj["source"]["data"] = ""
+        return {k: _remove_anthropic_image_data(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_remove_anthropic_image_data(item) for item in obj]
+    return obj

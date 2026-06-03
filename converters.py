@@ -233,7 +233,8 @@ def openai_to_anthropic_response(openai_resp: dict, model: str) -> dict:
         content.append({"type": "text", "text": message["content"]})
 
     # tool_calls
-    for tc in message.get("tool_calls", []):
+    tool_calls = message.get("tool_calls") or []
+    for tc in tool_calls:
         func = tc.get("function", {})
         arguments = func.get("arguments", "{}")
         try:
