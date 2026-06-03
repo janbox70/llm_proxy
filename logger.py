@@ -232,3 +232,200 @@ def _remove_image_data(obj):
     if isinstance(obj, list):
         return [_remove_image_data(item) for item in obj]
     return obj
+
+
+def _remove_anthropic_image_data(obj):
+    """清除 Anthropic 格式中的 base64 图片数据，避免日志爆炸"""
+    if isinstance(obj, dict):
+        if obj.get("type") == "image" and isinstance(obj.get("source"), dict):
+            if "data" in obj["source"]:
+                obj["source"]["data"] = ""
+        return {k: _remove_anthropic_image_data(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_remove_anthropic_image_data(item) for item in obj]
+    return obj
+
+
+class AnthropicChatLogger(ChatLogger):
+    """Anthropic Messages API 专用日志记录器"""
+
+    def __init__(self, log_path, provider: str, api_key: str, input_data: dict):
+        # 跳过 ChatLogger.__init__，直接调用更上层的初始化
+        self.log_path = log_path
+        self.provider = provider
+        self.api_key = api_key
+        self.input_data = input_data
+        self.output = {"content": "", "tool_calls": {}, "stop_reason": "", "usage": None}
+        self._image_index = 0
+        self.start_time = datetime.now()
+        self.first_token_time = None
+        self._image_ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        self._image_hash_index: "OrderedDict[int, str]" = OrderedDict()
+        self._image_hash_index_limit = 200
+        # SSE 解析缓冲
+        self._buffer = ""
+
+    def add_chunk(self, sse: bytes):
+        """
+        解析 Anthropic SSE 字节数据，累加到 output。
+        Anthropic SSE 每个事件由空行分隔，包含 event: 和 data: 行。
+        data: 行的 JSON 中有 type 字段标识事件类型。
+        """
+        if self.first_token_time is None:
+            self.first_token_time = datetime.now()
+
+        self._buffer += sse.decode("utf-8", errors="ignore")
+
+        # 按双换行分割完整事件块
+        while "\n\n" in self._buffer:
+            event_str, self._buffer = self._buffer.split("\n\n", 1)
+            self._process_event(event_str)
+
+    def _process_event(self, event_str: str):
+        """处理一个完整的 SSE 事件块"""
+        for line in event_str.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            content = line[5:].strip()
+            if not content:
+                continue
+
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = data.get("type", "")
+
+            if event_type == "message_start":
+                msg = data.get("message", {})
+                if "usage" in msg and msg["usage"]:
+                    self.output["usage"] = dict(msg["usage"])
+
+            elif event_type == "content_block_start":
+                block = data.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    idx = data.get("index", 0)
+                    self.output["tool_calls"][idx] = {
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "input": "",
+                    }
+
+            elif event_type == "content_block_delta":
+                delta = data.get("delta", {})
+                delta_type = delta.get("type", "")
+
+                if delta_type == "text_delta":
+                    self.output["content"] += delta.get("text", "")
+
+                elif delta_type == "input_json_delta":
+                    idx = data.get("index", 0)
+                    if idx in self.output["tool_calls"]:
+                        self.output["tool_calls"][idx]["input"] += delta.get(
+                            "partial_json", ""
+                        )
+
+            elif event_type == "message_delta":
+                delta = data.get("delta", {})
+                if "stop_reason" in delta:
+                    self.output["stop_reason"] = delta["stop_reason"]
+                if "usage" in delta and delta["usage"]:
+                    if self.output["usage"] is None:
+                        self.output["usage"] = {}
+                    self.output["usage"].update(delta["usage"])
+
+    async def write_log(self, output=None):
+        # 处理 Anthropic 格式的图片（base64 内嵌在 source.data 中）
+        await self._process_anthropic_images(self.input_data)
+
+        # 丢弃 tools 完整定义，仅保留名称列表
+        tools = self.input_data.pop("tools", None)
+        if tools is not None:
+            self.input_data["tools_list"] = [t.get("name", "") for t in tools]
+
+        data = {
+            "st": self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ft": (
+                (self.first_token_time - self.start_time).total_seconds()
+                if self.first_token_time
+                else 0
+            ),
+            "time": (datetime.now() - self.start_time).total_seconds(),
+            "api_key": self.api_key,
+            "input": self.input_data,
+            "output": self.output if output is None else output,
+        }
+        await self.write(data)
+
+    async def _process_anthropic_images(self, obj):
+        """
+        递归遍历 Anthropic 格式的 input_data，将 image content block 中的
+        base64 data 保存为本地文件，替换为文件名。
+        """
+        if isinstance(obj, dict):
+            if obj.get("type") == "image" and isinstance(obj.get("source"), dict):
+                source = obj["source"]
+                if source.get("type") == "base64" and "data" in source:
+                    media_type = source.get("media_type", "image/png")
+                    b64data = source["data"]
+                    filename = await self._save_b64_image(b64data, media_type)
+                    source["data"] = filename
+
+            for key, value in obj.items():
+                obj[key] = await self._process_anthropic_images(value)
+
+        elif isinstance(obj, list):
+            for idx, item in enumerate(obj):
+                obj[idx] = await self._process_anthropic_images(item)
+
+        return obj
+
+    async def _save_b64_image(self, b64data: str, media_type: str) -> str:
+        """
+        将 base64 图片数据保存为文件，返回文件名。
+        使用 hash 去重避免重复保存。
+        """
+        h = None
+        try:
+            h = mmh3.hash128(b64data, signed=False)
+            existing = self._image_hash_index.get(h)
+            if existing:
+                self._image_hash_index.move_to_end(h)
+                return existing
+            self._image_hash_index[h] = ""
+            self._image_hash_index.move_to_end(h)
+            while len(self._image_hash_index) > self._image_hash_index_limit:
+                self._image_hash_index.popitem(last=False)
+        except Exception:
+            h = None
+
+        try:
+            image_dir = Path(self.log_path) / "images"
+            image_dir.mkdir(parents=True, exist_ok=True)
+
+            index = self._image_index
+            self._image_index += 1
+
+            if "jpeg" in media_type or "jpg" in media_type:
+                ext = "jpg"
+            elif "webp" in media_type:
+                ext = "webp"
+            elif "gif" in media_type:
+                ext = "gif"
+            else:
+                ext = "png"
+
+            data = base64.b64decode(b64data)
+            filename = f"{self._image_ts}-{index}.{ext}"
+            file_path = image_dir / filename
+
+            async with aiofiles.open(file_path, "wb") as f:
+                await f.write(data)
+
+            if h is not None:
+                self._image_hash_index[h] = filename
+            return filename
+        except Exception:
+            return b64data
