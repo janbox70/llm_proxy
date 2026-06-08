@@ -187,6 +187,47 @@ async def standard_chat(provider: str, request: Request, api_key=Depends(get_api
     return response
 
 
+@app.post("/{provider}/embeddings", summary="标准OPEN AI embeddings接口")
+async def standard_embeddings(provider: str, request: Request, api_key=Depends(get_api_key)):
+
+    data = await request.json()
+
+    logger = ChatLogger(provider, api_key, data)
+
+    try:
+        site_config = (await load_config()).get(provider, {})
+        if 'base_url' not in site_config:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported provider: {provider}")
+
+        # 如果在白名单上，则使用预配置的 api_key
+        if api_key in site_config.get("authorized_keys", []):
+            api_key = site_config.get("api_key", api_key)
+
+        client = OpenAI(api_key=api_key,
+                        base_url=site_config.get("base_url", ""))
+
+        # 获取embeddings.create方法的参数
+        params = inspect.signature(client.embeddings.create).parameters
+
+        body, extra_body = {}, {}
+        for name, value in data.items():
+            if name in params:
+                body[name] = value
+            else:
+                extra_body[name] = value
+
+        response = await client.embeddings.create(**body, extra_body=extra_body)
+
+        await logger.write_log(response.model_dump())
+    except Exception as e:
+        print(f"ERROR!!: provider {provider}, api-key {api_key}")
+        print(data)
+        raise e
+
+    return response
+
+
 # ──────────────────────────────────────────────────────────────
 # Anthropic Messages API 代理
 # ──────────────────────────────────────────────────────────────
