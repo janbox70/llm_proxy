@@ -16,33 +16,10 @@ from converters import (
 )
 
 
-class ConfigManager:
-    """配置管理器，缓存配置并支持热加载"""
-    def __init__(self):
-        self._config = None
-        self._config_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "config.yaml"
-        )
-
-    async def load(self):
-        """加载配置文件"""
-        loop = asyncio.get_event_loop()
-        config = await loop.run_in_executor(None, self._load_config)
-        self._config = config
-        return config
-
-    def _load_config(self):
-        """同步加载配置"""
-        with open(self._config_path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
-
-    @property
-    def config(self):
-        """获取当前配置"""
-        return self._config
-
-
-config_manager = ConfigManager()
+async def load_config():
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 # 客户端缓存，避免重复创建
@@ -55,9 +32,9 @@ _httpx_clients: dict[str, httpx.AsyncClient] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    # 启动时加载配置
-    await config_manager.load()
+    # 第一阶段
     yield
+    
     # 关闭时清理 OpenAI 客户端
     for client in _client_cache.values():
         await client.close()
@@ -136,7 +113,7 @@ async def standard_chat(provider: str, request: Request, api_key=Depends(get_api
 
     data = await request.json()
 
-    config = config_manager.config
+    config = await load_config()
     if config is None:
         raise HTTPException(status_code=500, detail="Configuration not loaded")
 
@@ -285,7 +262,7 @@ async def anthropic_messages(
 ):
     data = await request.json()
 
-    config = config_manager.config
+    config = await load_config()
     if config is None:
         raise HTTPException(status_code=500, detail="Configuration not loaded")
 
