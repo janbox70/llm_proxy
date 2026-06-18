@@ -53,6 +53,31 @@ async def index():
     return "index"
 
 
+@app.head("/{provider}")
+@app.get("/{provider}")
+async def provider_health_check(provider: str):
+    """Provider 健康检查端点，支持 HEAD 和 GET 请求"""
+    config = await load_config()
+    if config is None:
+        raise HTTPException(status_code=500, detail="Configuration not loaded")
+    
+    providers = config.get("providers", {})
+    if provider not in providers:
+        raise HTTPException(
+            status_code=404, detail=f"Provider '{provider}' not found"
+        )
+    
+    # 对于 HEAD 请求，FastAPI 会自动处理为空响应
+    # 对于 GET 请求，返回 provider 基本信息
+    provider_info = {
+        "provider": provider,
+        "status": "available",
+        "base_url": providers[provider].get("base_url"),
+        "api_type": providers[provider].get("api_type", "openai-compatible")
+    }
+    return provider_info
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, ex):
     print(f"http_exception_handler: {ex}.")

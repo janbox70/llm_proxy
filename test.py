@@ -33,6 +33,36 @@ async def test_health_check():
         print("✅ 健康检查通过")
 
 
+async def test_provider_head_request():
+    """测试 Provider HEAD 请求（修复 404 错误）"""
+    print("\n=== 测试 1.5: Provider HEAD 请求 ===")
+    url = f"{BASE_URL}/arkcodingplan"
+    
+    async with httpx.AsyncClient() as client:
+        # 测试 HEAD 请求
+        response = await client.head(url)
+        print(f"HEAD 请求 - 状态码: {response.status_code}")
+        
+        if response.status_code == 200:
+            print("✅ Provider HEAD 请求测试通过")
+        elif response.status_code == 404:
+            print("❌ Provider HEAD 请求返回 404，未找到该 provider")
+            raise Exception(f"Provider 'arkcodingplan' not found")
+        else:
+            print(f"⚠️  预期 200，实际: {response.status_code}")
+            raise Exception(f"Unexpected status code: {response.status_code}")
+        
+        # 测试 GET 请求
+        response = await client.get(url)
+        print(f"GET 请求 - 状态码: {response.status_code}")
+        if response.status_code == 200:
+            data = response.json()
+            print(f"Provider 信息: {json.dumps(data, ensure_ascii=False)}")
+            print("✅ Provider GET 请求测试通过")
+        else:
+            print(f"❌ GET 请求失败: {response.status_code}")
+
+
 async def test_chat_completion_non_streaming():
     """测试非流式聊天完成"""
     print("\n=== 测试 2: 非流式聊天完成 ===")
@@ -411,6 +441,7 @@ async def main():
 
     tests = [
         test_health_check,
+        test_provider_head_request,
         test_chat_completion_non_streaming,
         test_chat_completion_streaming,
         test_unauthorized,
