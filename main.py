@@ -21,6 +21,12 @@ async def load_config():
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
+def get_site_config(config, provider: str):
+    providers = config.get("providers", {})
+    site_config = providers.get(provider, {})
+    if "alias" in site_config:
+        site_config = providers.get(site_config["alias"])
+    return site_config
 
 # 客户端缓存，避免重复创建
 _client_cache = {}
@@ -146,10 +152,17 @@ async def standard_chat(provider: str, request: Request, api_key=Depends(get_api
                         path="v1/chat/completions", upstream_path="v1/chat/completions")
 
     try:
-        site_config = config.get("providers", {}).get(provider, {})
+        site_config = get_site_config(config, provider)
         if not site_config or 'base_url' not in site_config:
             raise HTTPException(
                 status_code=400, detail=f"Unsupported provider: {provider}")
+
+        # 模型映射：如果配置了 models_mapping，则替换模型名称
+        models_mapping = site_config.get("models_mapping", {})
+        original_model = data.get("model")
+        if original_model and models_mapping and original_model in models_mapping:
+            data["model"] = models_mapping[original_model]
+            print(f"Model mapped: {original_model} -> {data['model']} for provider {provider}")
 
         # 如果在白名单上，则使用预配置的 api_key
         if api_key in site_config.get("authorized_keys", []):
@@ -197,7 +210,7 @@ async def standard_embeddings(provider: str, request: Request, api_key=Depends(g
     logger = ChatLogger(provider, api_key, data)
 
     try:
-        site_config = (await load_config()).get(provider, {})
+        site_config = get_site_config(await load_config(), provider)
         if 'base_url' not in site_config:
             raise HTTPException(
                 status_code=400, detail=f"Unsupported provider: {provider}")
@@ -297,11 +310,18 @@ async def anthropic_messages(
     )
 
     try:
-        site_config = config.get("providers", {}).get(provider, {})
+        site_config = get_site_config(config, provider)
         if not site_config or "base_url" not in site_config:
             raise HTTPException(
                 status_code=400, detail=f"Unsupported provider: {provider}"
             )
+
+        # 模型映射：如果配置了 models_mapping，则替换模型名称
+        models_mapping = site_config.get("models_mapping", {})
+        original_model = data.get("model")
+        if original_model and models_mapping and original_model in models_mapping:
+            data["model"] = models_mapping[original_model]
+            print(f"Model mapped (Anthropic): {original_model} -> {data['model']} for provider {provider}")
 
         # 如果在白名单上，替换为预配置的 api_key
         if api_key in site_config.get("authorized_keys", []):
